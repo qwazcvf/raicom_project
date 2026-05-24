@@ -1,0 +1,13 @@
+.cursorrules
+.marscode/*
+.env
+.idea
+.vscode
+bazel-*
+
+Raicom2026/mc/
+Raicom2026/sim_mujoco/
+Raicom2026/aimdk_msgs/
+Raicom2026/aimdk-aarch64-1bde262f-artifacts/
+
+*.zip

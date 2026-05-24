@@ -1,0 +1,1259 @@
+===== pwd / ls =====
+/home/agi/x2_deploy_workspace
+total 52
+drwxrwxr-x 6 agi agi 4096 May 24 03:26 .
+drwxr-x--- 1 agi agi 4096 May 24 02:59 ..
+drwxr-xr-x 8 agi agi 4096 May 24 02:40 aimdk-aarch64-1bde262f-artifacts
+drwxr-xr-x 6 agi agi 4096 May 24 02:47 aimdk_msgs
+drwxr-xr-x 2 agi agi 4096 May 24 03:26 competition
+-rw-rw-r-- 1 agi agi  166 May  7 06:18 .gitignore
+-rw-r--r-- 1 agi agi 1740 May 24 03:26 inspect_walk.sh
+-rw-rw-r-- 1 agi agi 4987 May  7 06:18 LICENSE
+drwxrwxr-x 7 agi agi 4096 May 23 14:55 Raicom2026
+-rw-rw-r-- 1 agi agi  370 May  7 06:18 README.md
+-rwxr-xr-x 1 agi agi 1167 May 23 12:36 ros.key
+===== important example files =====
+
+========== /home/agi/x2_deploy_workspace/aimdk-aarch64-1bde262f-artifacts/src/py_examples/py_examples/mc_locomotion_velocity.py ==========
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+import time
+import signal
+import sys
+
+from aimdk_msgs.msg import McLocomotionVelocity, MessageHeader
+from aimdk_msgs.srv import SetMcInputSource
+
+
+class DirectVelocityControl(Node):
+    def __init__(self):
+        super().__init__('direct_velocity_control')
+
+        self.publisher = self.create_publisher(
+            McLocomotionVelocity, '/aima/mc/locomotion/velocity', 10)
+        self.client = self.create_client(
+            SetMcInputSource, '/aimdk_5Fmsgs/srv/SetMcInputSource')
+
+        self.forward_velocity = 0.0
+        self.lateral_velocity = 0.0
+        self.angular_velocity = 0.0
+
+        self.max_forward_speed = 1.0
+        self.min_forward_speed = 0.2
+
+        self.max_lateral_speed = 1.0
+        self.min_lateral_speed = 0.2
+
+        self.max_angular_speed = 1.0
+        self.min_angular_speed = 0.1
+
+        self.timer = None
+
+        self.get_logger().info("Direct velocity control node started!")
+
+    def start_publish(self):
+        if not self.timer:
+            self.timer = self.create_timer(0.02, self.publish_velocity)
+
+    def register_input_source(self):
+        self.get_logger().info("Registering input source...")
+
+        timeout_sec = 8.0
+        start = self.get_clock().now().nanoseconds / 1e9
+
+        while not self.client.wait_for_service(timeout_sec=2.0):
+            now = self.get_clock().now().nanoseconds / 1e9
+            if now - start > timeout_sec:
+                self.get_logger().error("Waiting for service timed out")
+                return False
+            self.get_logger().info("Waiting for input source service...")
+
+        req = SetMcInputSource.Request()
+        req.action.value = 1001
+        req.input_source.name = "node"
+        req.input_source.priority = 40
+        req.input_source.timeout = 1000
+
+        for i in range(8):
+            req.request.header.stamp = self.get_clock().now().to_msg()
+            future = self.client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=0.25)
+
+            if future.done():
+                break
+
+            # retry as remote peer is NOT handled well by ROS
+            self.get_logger().info(f"trying to register input source... [{i}]")
+
+        if future.done():
+            try:
+                response = future.result()
+                state = response.response.state.value
+                self.get_logger().info(
+                    f"Input source set successfully: state={state}, task_id={response.response.task_id}")
+                return True
+            except Exception as e:
+                self.get_logger().error(f"Service call exception: {str(e)}")
+                return False
+        else:
+            self.get_logger().error("Service call failed or timed out")
+            return False
+
+    def publish_velocity(self):
+        msg = McLocomotionVelocity()
+        msg.header = MessageHeader()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.source = "node"
+        msg.forward_velocity = self.forward_velocity
+        msg.lateral_velocity = self.lateral_velocity
+        msg.angular_velocity = self.angular_velocity
+
+        self.publisher.publish(msg)
+
+        self.get_logger().info(
+            f"Publishing velocity: forward {self.forward_velocity:.2f} m/s, "
+            f"lateral {self.lateral_velocity:.2f} m/s, "
+            f"angular {self.angular_velocity:.2f} rad/s"
+        )
+
+    def set_forward(self, forward):
+        # check value range, mc has thresholds to start movement
+        if abs(forward) < 0.005:
+            self.forward_velocity = 0.0
+            return True
+        elif abs(forward) > self.max_forward_speed or abs(forward) < self.min_forward_speed:
+            raise ValueError("out of range")
+        else:
+            self.forward_velocity = forward
+            return True
+
+    def set_lateral(self, lateral):
+        # check value range, mc has thresholds to start movement
+        if abs(lateral) < 0.005:
+            self.lateral_velocity = 0.0
+            return True
+        elif abs(lateral) > self.max_lateral_speed or abs(lateral) < self.min_lateral_speed:
+            raise ValueError("out of range")
+        else:
+            self.lateral_velocity = lateral
+            return True
+
+    def set_angular(self, angular):
+        # check value range, mc has thresholds to start movement
+        if abs(angular) < 0.005:
+            self.angular_velocity = 0.0
+            return True
+        elif abs(angular) > self.max_angular_speed or abs(angular) < self.min_angular_speed:
+            raise ValueError("out of range")
+        else:
+            self.angular_velocity = angular
+            return True
+
+    def clear_velocity(self):
+        self.forward_velocity = 0.0
+        self.lateral_velocity = 0.0
+        self.angular_velocity = 0.0
+
+
+# Global node instance for signal handling
+global_node = None
+
+
+def signal_handler(sig, frame):
+    global global_node
+    if global_node is not None:
+        global_node.clear_velocity()
+        global_node.get_logger().info(
+            f"Received signal {sig}, clearing velocity and shutting down")
+    if rclpy.ok():
+        rclpy.shutdown()
+    sys.exit(0)
+
+
+def main():
+    global global_node
+    rclpy.init()
+
+    node = DirectVelocityControl()
+    global_node = node
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    if not node.register_input_source():
+        node.get_logger().error("Input source registration failed, exiting")
+        if rclpy.ok():
+            rclpy.shutdown()
+        return
+
+    # get and check control values
+    # notice that mc has thresholds to start movement
+    try:
+        # get input forward
+        forward = float(
+            input("Please enter forward velocity 0 or ±(0.2 ~ 1.0) m/s: "))
+        node.set_forward(forward)
+        # get input lateral
+        lateral = float(
+            input("Please enter lateral velocity 0 or ±(0.2 ~ 1.0) m/s: "))
+        node.set_lateral(lateral)
+        # get input angular
+        angular = float(
+            input("Please enter angular velocity 0 or ±(0.1 ~ 1.0) rad/s: "))
+        node.set_angular(angular)
+    except Exception as e:
+        node.get_logger().error(f"Invalid input: {e}")
+        if rclpy.ok():
+            rclpy.shutdown()
+        return
+
+    node.get_logger().info("Setting velocity, moving for 5 seconds")
+    node.start_publish()
+
+    start = node.get_clock().now()
+    while (node.get_clock().now() - start).nanoseconds / 1e9 < 5.0:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        time.sleep(0.001)
+
+    node.clear_velocity()
+    node.get_logger().info("5-second motion finished, robot stopped")
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+========== /home/agi/x2_deploy_workspace/aimdk-aarch64-1bde262f-artifacts/src/py_examples/py_examples/navigation.py ==========
+#!/usr/bin/env python3
+
+import time
+import threading
+import rclpy
+import rclpy.logging
+from rclpy.node import Node
+
+from aimdk_msgs.msg import PncTaskRequest, MessageHeader
+from geometry_msgs.msg import PoseStamped
+
+# task_request enum
+TASK_REQUEST_START = 1
+TASK_REQUEST_STOP = 2
+TASK_REQUEST_PAUSE = 3
+TASK_REQUEST_RESUME = 4
+
+
+class NavigationNode(Node):
+    def __init__(self):
+        super().__init__('navigation_example')
+        self.publisher = self.create_publisher(
+            PncTaskRequest, '/aima/te/pnc_task_request', 10
+        )
+
+        now_ms = int(time.time() * 1000)
+        self.task_id = now_ms
+        self.map_id = 0
+        self.timer = None
+        self.current_msg = None
+
+        self.get_logger().info(
+            f'Navigation node started, task_id={self.task_id}')
+
+    def send_start(self, map_id, x, y, z, ox, oy, oz, ow, radius, pnc_mode, max_speed):
+        self.map_id = map_id
+        msg = PncTaskRequest()
+        msg.header = self._make_header()
+        msg.task_type = 2
+        msg.task_request = TASK_REQUEST_START
+        msg.pnc_mode = pnc_mode
+        msg.max_forward_speed = max_speed
+        msg.task_id = self.task_id
+        msg.map_id = map_id
+        msg.target_pose_radius = radius
+        msg.reserve_info = ['\x00'] * 64
+
+        target = PoseStamped()
+        target.header.stamp = self.get_clock().now().to_msg()
+        target.header.frame_id = 'map'
+        target.pose.position.x = x
+        target.pose.position.y = y
+        target.pose.position.z = z
+        target.pose.orientation.x = ox
+        target.pose.orientation.y = oy
+        target.pose.orientation.z = oz
+        target.pose.orientation.w = ow
+        msg.target_pose = target
+
+        self.get_logger().info(
+            f'[Start Navigation] task_id={self.task_id}, map_id={map_id}, '
+            f'target=({x:.2f}, {y:.2f}, {z:.2f}), radius={radius:.2f}')
+        self._start_publishing(msg)
+
+    def send_pause(self):
+        msg = self._make_simple_request(TASK_REQUEST_PAUSE, 0)
+        self.get_logger().info(f'[Pause Navigation] task_id={self.task_id}')
+        self._start_publishing(msg)
+
+    def send_resume(self):
+        msg = self._make_simple_request(TASK_REQUEST_RESUME, self.map_id)
+        self.get_logger().info(
+            f'[Resume Navigation] task_id={self.task_id}, map_id={self.map_id}')
+        self._start_publishing(msg)
+
+    def send_stop(self):
+        msg = self._make_simple_request(TASK_REQUEST_STOP, self.map_id)
+        self.get_logger().info(
+            f'[Stop Navigation] task_id={self.task_id}, map_id={self.map_id}')
+        self._start_publishing(msg)
+
+    def stop_publishing(self):
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+            self.get_logger().info('Stopped continuous publishing')
+
+    def _start_publishing(self, msg):
+        self.current_msg = msg
+        if self.timer:
+            self.timer.cancel()
+        self.publisher.publish(self.current_msg)
+
+        def timer_callback():
+            self.current_msg.header.stamp = self.get_clock().now().to_msg()
+            self.current_msg.header.meas_stamp = self.get_clock().now().to_msg()
+            self.current_msg.target_pose.header.stamp = self.get_clock().now().to_msg()
+            self.publisher.publish(self.current_msg)
+
+        self.timer = self.create_timer(1.0, timer_callback)
+        self.get_logger().info('Continuous publishing at 1Hz')
+
+    def _make_header(self):
+        header = MessageHeader()
+        now = self.get_clock().now().to_msg()
+        header.stamp = now
+        header.meas_stamp = now
+        header.frame_id = 'map'
+        header.sequence = 0
+        return header
+
+    def _make_simple_request(self, task_request, map_id):
+        msg = PncTaskRequest()
+        msg.header = self._make_header()
+        msg.task_type = 2
+        msg.task_request = task_request
+        msg.pnc_mode = 0
+        msg.max_forward_speed = 0.5
+        msg.task_id = self.task_id
+        msg.map_id = map_id
+        msg.target_pose_radius = 0.0
+        msg.reserve_info = ['\x00'] * 64
+        msg.target_pose.pose.orientation.w = 1.0
+        return msg
+
+
+def input_value(prompt, default_val):
+    """带默认值的输入，直接回车使用默认值"""
+    line = input(f'{prompt} [{default_val}]: ').strip()
+    if not line:
+        return default_val
+    return type(default_val)(line)
+
+
+def print_menu(task_id):
+    print(f'\n========================================')
+    print(f'  Navigation Control  (task_id={task_id})')
+    print(f'========================================')
+    print(f'  1. Start Navigation')
+    print(f'  2. Pause Navigation')
+    print(f'  3. Resume Navigation')
+    print(f'  4. Stop Navigation')
+    print(f'  q. Quit')
+    print(f'========================================')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = NavigationNode()
+
+    spin_thread = threading.Thread(
+        target=rclpy.spin, args=(node,), daemon=True)
+    spin_thread.start()
+
+    node.get_logger().info('Waiting for node communication ready (5s)...')
+    time.sleep(5)
+
+    try:
+        while rclpy.ok():
+            print_menu(node.task_id)
+            choice = input('Select an option: ').strip()
+
+            if choice == '1':
+                print('\n--- Start Navigation Parameters ---')
+                map_id = input_value('Map ID (map_id)', 1773113429735)
+                x = input_value('Target x', 1.0)
+                y = input_value('Target y', 2.0)
+                z = input_value('Target z', 0.0)
+                ox = input_value('Orientation x', 0.0)
+                oy = input_value('Orientation y', 0.0)
+                oz = input_value('Orientation z', 0.0)
+                ow = input_value('Orientation w', 1.0)
+                radius = input_value('Target pose radius', 0.5)
+                pnc_mode = input_value('pnc_mode', 0)
+                max_speed = input_value('Max forward speed', 0.5)
+                node.send_start(map_id, x, y, z, ox, oy, oz, ow,
+                                radius, pnc_mode, max_speed)
+            elif choice == '2':
+                node.send_pause()
+            elif choice == '3':
+                node.send_resume()
+            elif choice == '4':
+                node.send_stop()
+            elif choice in ('q', 'Q'):
+                node.stop_publishing()
+                print('Exiting navigation control.')
+                break
+            else:
+                print('Invalid input, please try again.')
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        rclpy.logging.get_logger('main').error(
+            f'Program exited with exception: {e}')
+
+    node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+========== /home/agi/x2_deploy_workspace/aimdk-aarch64-1bde262f-artifacts/src/py_examples/py_examples/motocontrol.py ==========
+#!/usr/bin/env python3
+"""
+Robot joint control example
+This script implements a ROS2-based robot joint control system, using the Ruckig trajectory
+planner to achieve smooth joint motion control.
+
+Main features:
+1. Supports controlling multiple joint areas (head, arm, waist, leg)
+2. Uses Ruckig for trajectory planning to ensure smooth motion
+3. Supports real-time control of joint position, velocity, and acceleration
+4. Provides joint limit and PID (stiffness/damping) parameter configuration
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from aimdk_msgs.msg import JointCommandArray, JointStateArray, JointCommand
+from std_msgs.msg import Header
+import ruckig
+from enum import Enum
+from dataclasses import dataclass
+from typing import List, Dict
+from threading import Lock
+
+# QoS config: define ROS2 Quality of Service parameters
+# Subscriber QoS: best-effort reliability, keep last 10 messages
+subscriber_qos = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+    durability=DurabilityPolicy.VOLATILE
+)
+
+# Publisher QoS: reliable transport, keep last 10 messages
+publisher_qos = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
+    durability=DurabilityPolicy.VOLATILE
+)
+
+
+class JointArea(Enum):
+    HEAD = 'HEAD'    # Head joints
+    ARM = 'ARM'      # Arm joints
+    WAIST = 'WAIST'  # Waist joints
+    LEG = 'LEG'      # Leg joints
+
+
+@dataclass
+class JointInfo:
+    # Joint information data class
+    name: str           # Joint name
+    lower_limit: float  # Joint lower angle limit
+    upper_limit: float  # Joint upper angle limit
+    kp: float           # Position control proportional gain
+    kd: float           # Velocity control derivative gain
+
+
+# Robot model configuration: define all joint parameters
+robot_model: Dict[JointArea, List[JointInfo]] = {
+    # Leg joint configuration
+    JointArea.LEG: [
+        # Left leg joints
+        JointInfo("left_hip_pitch_joint", -2.704, 2.556, 40.0, 4.0),
+        JointInfo("left_hip_roll_joint", -0.235, 2.906, 40.0, 4.0),
+        JointInfo("left_hip_yaw_joint", -1.684, 3.430, 30.0, 3.0),
+        JointInfo("left_knee_joint", 0.0000, 2.4073, 80.0, 8.0),
+        JointInfo("left_ankle_pitch_joint", -0.803, 0.453, 40.0, 4.0),
+        JointInfo("left_ankle_roll_joint", -0.2625, 0.2625, 20.0, 2.0),
+        # Right leg joints
+        JointInfo("right_hip_pitch_joint", -2.704, 2.556, 40.0, 4.0),
+        JointInfo("right_hip_roll_joint", -2.906, 0.235, 40.0, 4.0),
+        JointInfo("right_hip_yaw_joint", -3.430, 1.684, 30.0, 3.0),
+        JointInfo("right_knee_joint", 0.0000, 2.4073, 80.0, 8.0),
+        JointInfo("right_ankle_pitch_joint", -0.803, 0.453, 40.0, 4.0),
+        JointInfo("right_ankle_roll_joint", -0.2625, 0.2625, 20.0, 2.0),
+    ],
+    # Waist joint configuration
+    JointArea.WAIST: [
+        JointInfo("waist_yaw_joint", -3.43, 2.382, 20.0, 4.0),
+        JointInfo("waist_pitch_joint", -0.314, 0.314, 20.0, 4.0),
+        JointInfo("waist_roll_joint", -0.488, 0.488, 20.0, 4.0),
+    ],
+    # Arm joint configuration
+    JointArea.ARM: [
+        # Left arm
+        JointInfo("left_shoulder_pitch_joint", -3.08, 2.04, 20.0, 2.0),
+        JointInfo("left_shoulder_roll_joint", -0.061, 2.993, 20.0, 2.0),
+        JointInfo("left_shoulder_yaw_joint", -2.556, 2.556, 20.0, 2.0),
+        JointInfo("left_elbow_joint", -2.3556, 0.0, 20.0, 2.0),
+        JointInfo("left_wrist_yaw_joint", -2.556, 2.556, 20.0, 2.0),
+        JointInfo("left_wrist_pitch_joint", -0.558, 0.558, 20.0, 2.0),
+        JointInfo("left_wrist_roll_joint", -1.571, 0.724, 20.0, 2.0),
+        # Right arm
+        JointInfo("right_shoulder_pitch_joint", -3.08, 2.04, 20.0, 2.0),
+        JointInfo("right_shoulder_roll_joint", -2.993, 0.061, 20.0, 2.0),
+        JointInfo("right_shoulder_yaw_joint", -2.556, 2.556, 20.0, 2.0),
+        JointInfo("right_elbow_joint", -2.3556, 0.0000, 20.0, 2.0),
+        JointInfo("right_wrist_yaw_joint", -2.556, 2.556, 20.0, 2.0),
+        JointInfo("right_wrist_pitch_joint", -0.558, 0.558, 20.0, 2.0),
+        JointInfo("right_wrist_roll_joint", -0.724, 1.571, 20.0, 2.0),
+    ],
+    # Head joint configuration
+    JointArea.HEAD: [
+        JointInfo("head_yaw_joint", -0.366, 0.366, 20.0, 2.0),
+        JointInfo("head_pitch_joint", -0.3838, 0.3838, 20.0, 2.0),
+    ],
+}
+
+
+class JointControllerNode(Node):
+    """
+    Joint controller node
+    Responsible for receiving joint states, using Ruckig for trajectory planning,
+    and publishing joint commands.
+    """
+
+    def __init__(self, node_name: str, sub_topic: str, pub_topic: str, area: JointArea, dofs: int):
+        """
+        Initialize joint controller
+        Args:
+            node_name: node name
+            sub_topic: topic name to subscribe (joint states)
+            pub_topic: topic name to publish (joint commands)
+            area: joint area (head/arm/waist/leg)
+            dofs: number of DOFs
+        """
+        super().__init__(node_name)
+        self.lock = Lock()
+        self.joint_info = robot_model[area]
+        self.dofs = dofs
+        self.ruckig = ruckig.Ruckig(dofs, 0.002)  # 2 ms control period
+        self.input = ruckig.InputParameter(dofs)
+        self.output = ruckig.OutputParameter(dofs)
+        self.ruckig_initialized = False
+
+        # Initialize trajectory parameters
+        self.input.current_position = [0.0] * dofs
+        self.input.current_velocity = [0.0] * dofs
+        self.input.current_acceleration = [0.0] * dofs
+
+        # Motion limits
+        self.input.max_velocity = [1.0] * dofs
+        self.input.max_acceleration = [1.0] * dofs
+        self.input.max_jerk = [25.0] * dofs
+
+        # ROS2 subscriber and publisher
+        self.sub = self.create_subscription(
+            JointStateArray,
+            sub_topic,
+            self.joint_state_callback,
+            subscriber_qos
+        )
+        self.pub = self.create_publisher(
+            JointCommandArray,
+            pub_topic,
+            publisher_qos
+        )
+
+    def joint_state_callback(self, msg: JointStateArray):
+        """
+        Joint state callback
+        Receives and processes joint state messages
+        """
+        self.ruckig_initialized = True
+
+    def control_callback(self, joint_idx):
+        """
+        Control callback
+        Uses Ruckig for trajectory planning and publishes control commands
+        Args:
+            joint_idx: target joint index
+        """
+        # Run Ruckig until the target is reached
+        while self.ruckig.update(self.input, self.output) in [ruckig.Result.Working, ruckig.Result.Finished]:
+            # Update current state
+            self.input.current_position = self.output.new_position
+            self.input.current_velocity = self.output.new_velocity
+            self.input.current_acceleration = self.output.new_acceleration
+
+            # Check if target is reached
+            tolerance = 1e-6
+            current_p = self.output.new_position[joint_idx]
+            if abs(current_p - self.input.target_position[joint_idx]) < tolerance:
+                break
+
+            # Create and publish command
+            cmd = JointCommandArray()
+            for i, joint in enumerate(self.joint_info):
+                j = JointCommand()
+                j.name = joint.name
+                j.position = self.output.new_position[i]
+                j.velocity = self.output.new_velocity[i]
+                j.effort = 0.0
+                j.stiffness = joint.kp
+                j.damping = joint.kd
+                cmd.joints.append(j)
+
+            self.pub.publish(cmd)
+
+    def set_target_position(self, joint_name, position):
+        """
+        Set target joint position
+        Args:
+            joint_name: joint name
+            position: target position
+        """
+        p_s = [0.0] * self.dofs
+        joint_idx = 0
+        for i, joint in enumerate(self.joint_info):
+            if joint.name == joint_name:
+                p_s[i] = position
+                joint_idx = i
+        self.input.target_position = p_s
+        self.input.target_velocity = [0.0] * self.dofs
+        self.input.target_acceleration = [0.0] * self.dofs
+        self.control_callback(joint_idx)
+
+
+def main(args=None):
+    """
+    Main function
+    Initialize ROS2 node and start joint controller
+    """
+    rclpy.init(args=args)
+
+    # Create leg controller node
+    leg_node = JointControllerNode(
+        "leg_node",
+        "/aima/hal/joint/leg/state",
+        "/aima/hal/joint/leg/command",
+        JointArea.LEG,
+        12
+    )
+
+    # waist_node = JointControllerNode(
+    #     "waist_node",
+    #     "/aima/hal/joint/waist/state",
+    #     "/aima/hal/joint/waist/command",
+    #     JointArea.WAIST,
+    #     3
+    # )
+
+    # arm_node = JointControllerNode(
+    #     "arm_node",
+    #     "/aima/hal/joint/arm/state",
+    #     "/aima/hal/joint/arm/command",
+    #     JointArea.ARM,
+    #     14
+    # )
+
+    # head_node = JointControllerNode(
+    #     "head_node",
+    #     "/aima/hal/joint/head/state",
+    #     "/aima/hal/joint/head/command",
+    #     JointArea.HEAD,
+    #     2
+    # )
+
+
+========== /home/agi/x2_deploy_workspace/aimdk-aarch64-1bde262f-artifacts/src/py_examples/py_examples/keyboard.py ==========
+#!/usr/bin/env python3
+
+import rclpy
+import rclpy.logging
+from rclpy.node import Node
+from aimdk_msgs.msg import McLocomotionVelocity, MessageHeader
+from aimdk_msgs.srv import SetMcInputSource
+import curses
+import time
+
+
+class KeyboardVelocityController(Node):
+    def __init__(self, stdscr):
+        super().__init__('keyboard_velocity_controller')
+        self.stdscr = stdscr
+        self.forward_velocity = 0.0
+        self.lateral_velocity = 0.0
+        self.angular_velocity = 0.0
+        self.step = 0.2
+        self.angular_step = 0.1
+
+        self.publisher = self.create_publisher(
+            McLocomotionVelocity, '/aima/mc/locomotion/velocity', 10)
+        self.client = self.create_client(
+            SetMcInputSource, '/aimdk_5Fmsgs/srv/SetMcInputSource')
+
+        if not self.register_input_source():
+            self.get_logger().error("Input source registration failed, exiting")
+            raise RuntimeError("Failed to register input source")
+
+        # Configure curses
+        curses.cbreak()
+        curses.noecho()
+        self.stdscr.keypad(True)
+        self.stdscr.nodelay(True)
+
+        self.get_logger().info(
+            "Control started: W/S forward/backward, A/D strafe, Q/E turn, Space stop, Esc exit")
+
+        # Timer: check keyboard every 50 ms
+        self.timer = self.create_timer(0.05, self.check_key_and_publish)
+
+    def register_input_source(self):
+        self.get_logger().info("Registering input source...")
+
+        timeout_sec = 8.0
+        start = self.get_clock().now().nanoseconds / 1e9
+
+        while not self.client.wait_for_service(timeout_sec=2.0):
+            now = self.get_clock().now().nanoseconds / 1e9
+            if now - start > timeout_sec:
+                self.get_logger().error("Waiting for service timed out")
+                return False
+            self.get_logger().info("Waiting for input source service...")
+
+        req = SetMcInputSource.Request()
+        req.action.value = 1001
+        req.input_source.name = "node"
+        req.input_source.priority = 40
+        req.input_source.timeout = 1000
+
+        for i in range(8):
+            req.request.header.stamp = self.get_clock().now().to_msg()
+            future = self.client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=0.25)
+
+            if future.done():
+                break
+
+            # retry as remote peer is NOT handled well by ROS
+            self.get_logger().info(f"trying to register input source... [{i}]")
+
+        if future.done():
+            try:
+                resp = future.result()
+                state = resp.response.state.value
+                self.get_logger().info(
+                    f"Input source set successfully: state={state}, task_id={resp.response.task_id}")
+                return True
+            except Exception as e:
+                self.get_logger().error(f"Service exception: {str(e)}")
+                return False
+        else:
+            self.get_logger().error("Service call failed or timed out")
+            return False
+
+    def check_key_and_publish(self):
+        try:
+            ch = self.stdscr.getch()
+        except Exception:
+            ch = -1
+
+        if ch != -1:
+            if ch == ord(' '):
+                self.forward_velocity = 0.0
+                self.lateral_velocity = 0.0
+                self.angular_velocity = 0.0
+            elif ch == ord('w'):
+                self.forward_velocity = min(
+                    self.forward_velocity + self.step, 1.0)
+            elif ch == ord('s'):
+                self.forward_velocity = max(
+                    self.forward_velocity - self.step, -1.0)
+            elif ch == ord('a'):
+                self.lateral_velocity = min(
+                    self.lateral_velocity + self.step, 1.0)
+            elif ch == ord('d'):
+                self.lateral_velocity = max(
+                    self.lateral_velocity - self.step, -1.0)
+            elif ch == ord('q'):
+                self.angular_velocity = min(
+                    self.angular_velocity + self.angular_step, 1.0)
+            elif ch == ord('e'):
+                self.angular_velocity = max(
+                    self.angular_velocity - self.angular_step, -1.0)
+            elif ch == 27:  # ESC
+                self.get_logger().info("Exiting control")
+                self.timer.cancel()
+                return
+
+        msg = McLocomotionVelocity()
+        msg.header = MessageHeader()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.source = "node"
+        msg.forward_velocity = self.forward_velocity
+        msg.lateral_velocity = self.lateral_velocity
+        msg.angular_velocity = self.angular_velocity
+
+        self.publisher.publish(msg)
+
+        # Update UI
+        self.stdscr.clear()
+        self.stdscr.addstr(
+            0, 0, "W/S: Forward/Backward | A/D: Strafe | Q/E: Turn | Space: Stop | ESC: Exit")
+        self.stdscr.addstr(2, 0,
+                           f"Speed Status: Forward: {self.forward_velocity:.2f} m/s | "
+                           f"Lateral: {self.lateral_velocity:.2f} m/s | "
+                           f"Angular: {self.angular_velocity:.2f} rad/s")
+        self.stdscr.refresh()
+
+
+def curses_main(stdscr):
+    rclpy.init()
+    try:
+        node = KeyboardVelocityController(stdscr)
+        while not node.timer.is_canceled():
+            rclpy.spin_once(node, timeout_sec=0.1)
+    except (Exception, KeyboardInterrupt) as e:
+        rclpy.logging.get_logger("main").fatal(
+            f"Program exited with exception: {e}")
+    finally:
+        curses.endwin()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def main():
+    curses.wrapper(curses_main)
+
+
+if __name__ == '__main__':
+    main()
+
+========== /home/agi/x2_deploy_workspace/aimdk-aarch64-1bde262f-artifacts/src/py_examples/py_examples/set_mc_input_source.py ==========
+#!/usr/bin/env python3
+
+import rclpy
+import rclpy.logging
+from rclpy.node import Node
+
+from aimdk_msgs.srv import SetMcInputSource
+from aimdk_msgs.msg import RequestHeader, McInputAction
+
+
+class McInputClient(Node):
+    def __init__(self):
+        super().__init__('set_mc_input_source_client')
+        self.client = self.create_client(
+            SetMcInputSource, '/aimdk_5Fmsgs/srv/SetMcInputSource'
+        )
+
+        self.get_logger().info('✅ SetMcInputSource client node created.')
+
+        # Wait for the service to become available
+        while not self.client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().info('⏳ Service unavailable, waiting...')
+
+        self.get_logger().info('🟢 Service available, ready to send request.')
+
+    def send_request(self):
+        req = SetMcInputSource.Request()
+
+        # header
+        req.request.header = RequestHeader()
+
+        # action (e.g. 1001 = register)
+        req.action = McInputAction()
+        req.action.value = 1001
+
+        # input source info
+        req.input_source.name = 'node'
+        req.input_source.priority = 40
+        req.input_source.timeout = 1000  # ms
+
+        # Send request and wait for response
+        self.get_logger().info(
+            f'📨 Sending input source request: action_id={req.action.value}, '
+            f'name={req.input_source.name}, priority={req.input_source.priority}'
+        )
+        for i in range(8):
+            req.request.header.stamp = self.get_clock().now().to_msg()
+            future = self.client.call_async(req)
+            rclpy.spin_until_future_complete(
+                self, future, timeout_sec=0.25)
+
+            if future.done():
+                break
+
+            # retry as remote peer is NOT handled well by ROS
+            self.get_logger().info(f'trying ... [{i}]')
+
+        if not future.done():
+            self.get_logger().error('❌ Service call failed or timed out.')
+            return False
+
+        response = future.result()
+        ret_code = response.response.header.code
+        task_id = response.response.task_id
+
+        if ret_code == 0:
+            self.get_logger().info(
+                f'✅ Input source set successfully. task_id={task_id}'
+            )
+            return True
+        else:
+            self.get_logger().error(
+                f'❌ Input source set failed. ret_code={ret_code}, task_id={task_id} (duplicated ADD? or MODIFY/ENABLE/DISABLE for unknown source?)'
+            )
+            return False
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    node = None
+    try:
+        node = McInputClient()
+        ok = node.send_request()
+        if not ok:
+            node.get_logger().error('Input source request failed.')
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        rclpy.logging.get_logger('main').error(
+            f'Program exited with exception: {e}')
+
+    if node:
+        node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+========== /home/agi/x2_deploy_workspace/aimdk-aarch64-1bde262f-artifacts/src/py_examples/py_examples/set_mc_action.py ==========
+#!/usr/bin/env python3
+
+import sys
+import rclpy
+import rclpy.logging
+from rclpy.node import Node
+
+from aimdk_msgs.srv import SetMcAction
+from aimdk_msgs.msg import RequestHeader, CommonState, McAction, McActionCommand
+
+
+class SetMcActionClient(Node):
+    def __init__(self):
+        super().__init__('set_mc_action_client')
+        self.client = self.create_client(
+            SetMcAction, '/aimdk_5Fmsgs/srv/SetMcAction'
+        )
+        self.get_logger().info('✅ SetMcAction client node created.')
+
+        # Wait for the service to become available
+        while not self.client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().info('⏳ Service unavailable, waiting...')
+
+        self.get_logger().info('🟢 Service available, ready to send request.')
+
+    def send_request(self, action_name: str):
+        req = SetMcAction.Request()
+        req.header = RequestHeader()
+        # 解决source域缺失的问题，添加了默认的'node'作为source
+        req.source = 'node'
+        #
+        cmd = McActionCommand()
+        cmd.action_desc = action_name
+        req.command = cmd
+
+        self.get_logger().info(
+            f'📨 Sending request to set robot mode: {action_name}')
+        for i in range(8):
+            req.header.stamp = self.get_clock().now().to_msg()
+            future = self.client.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=0.25)
+
+            if future.done():
+                break
+
+            # retry as remote peer is NOT handled well by ROS
+            self.get_logger().info(f'trying ... [{i}]')
+
+        response = future.result()
+        if response is None:
+            self.get_logger().error('❌ Service call failed or timed out.')
+            return
+
+        if response.response.status.value == CommonState.SUCCESS:
+            self.get_logger().info('✅ Robot mode set successfully.')
+        else:
+            self.get_logger().error(
+                f'❌ Failed to set robot mode: {response.response.message}'
+            )
+
+
+def main(args=None):
+    action_info = {
+        'PASSIVE_DEFAULT': ('PD', 'joints with zero torque'),
+        'DAMPING_DEFAULT': ('DD', 'joints in damping mode'),
+        'JOINT_DEFAULT': ('JD', 'Position Control Stand (joints locked)'),
+        'STAND_DEFAULT': ('SD', 'Stable Stand (auto-balance)'),
+        'LOCOMOTION_DEFAULT': ('LD', 'locomotion mode (walk or run)'),
+        'HEAD_ONLY': ('HO', 'head-only control'),
+        'UPPERBODY_REMOTE_SPLIT': ('US', 'upper-body-only control'),
+    }
+
+    choices = {}
+    for k, v in action_info.items():
+        choices[v[0]] = k
+
+    rclpy.init(args=args)
+    node = None
+    try:
+        # Prefer command-line argument, otherwise prompt for input
+        if len(sys.argv) > 1:
+            motion = sys.argv[1]
+        else:
+            print('{:<4} - {:<24} : {}'.format('abbr',
+                  'robot mode', 'description'))
+            for k, v in action_info.items():
+                print(f'{v[0]:<4} - {k:<24} : {v[1]}')
+            motion = input('Enter abbr of robot mode:')
+
+        action_name = choices.get(motion)
+        if not action_name:
+            raise ValueError(f'Invalid abbr of robot mode: {motion}')
+
+        node = SetMcActionClient()
+        node.send_request(action_name)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        rclpy.logging.get_logger('main').error(
+            f'Program exited with exception: {e}')
+
+    if node:
+        node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+===== ros2 interface show =====
+
+========== aimdk_msgs/msg/McLocomotionVelocity ==========
+# 消息头
+MessageHeader header
+	builtin_interfaces/Time stamp
+		int32 sec
+		uint32 nanosec
+	string frame_id
+	uint32 sequence
+	builtin_interfaces/Time meas_stamp
+		int32 sec
+		uint32 nanosec
+
+# 输入源
+string source
+
+# 前进速度 (m/s)
+# 方向: +为前进, -为后退
+float64 forward_velocity
+
+# 侧移速度 (m/s)
+# 方向: +为左移, -为右移
+float64 lateral_velocity
+
+# 旋转速度 (角速度) (m/s)
+# 方向: +为左旋转, -为右旋转
+float64 angular_velocity
+
+========== aimdk_msgs/msg/McLocomotionSpeedMode ==========
+Error processing '// generated from rosidl_adapter/resource/msg.idl.em' of 'aimdk_msgs/McLocomotionSpeedMode': '//'
+Traceback (most recent call last):
+  File "/opt/ros/humble/bin/ros2", line 33, in <module>
+    sys.exit(load_entry_point('ros2cli==0.18.18', 'console_scripts', 'ros2')())
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2cli/cli.py", line 91, in main
+    rc = extension.main(parser=parser, args=args)
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/command/interface.py", line 35, in main
+    return extension.main(args=args)
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/verb/show.py", line 201, in main
+    _show_interface(
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/verb/show.py", line 148, in _show_interface
+    for line in _get_interface_lines(interface_identifier):
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/verb/show.py", line 116, in _get_interface_lines
+    yield InterfaceTextLine(
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/verb/show.py", line 43, in __init__
+    msg_spec = parse_message_string(
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rosidl_adapter/parser.py", line 520, in parse_message_string
+    Type(type_string, context_package_name=pkg_name),
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rosidl_adapter/parser.py", line 277, in __init__
+    super(Type, self).__init__(
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rosidl_adapter/parser.py", line 190, in __init__
+    raise InvalidResourceName(type_string)
+rosidl_adapter.parser.InvalidResourceName: //
+
+========== aimdk_msgs/msg/McLocomotionSpeedStatus ==========
+Error processing '// generated from rosidl_adapter/resource/msg.idl.em' of 'aimdk_msgs/McLocomotionSpeedStatus': '//'
+Traceback (most recent call last):
+  File "/opt/ros/humble/bin/ros2", line 33, in <module>
+    sys.exit(load_entry_point('ros2cli==0.18.18', 'console_scripts', 'ros2')())
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2cli/cli.py", line 91, in main
+    rc = extension.main(parser=parser, args=args)
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/command/interface.py", line 35, in main
+    return extension.main(args=args)
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/verb/show.py", line 201, in main
+    _show_interface(
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/verb/show.py", line 148, in _show_interface
+    for line in _get_interface_lines(interface_identifier):
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/verb/show.py", line 116, in _get_interface_lines
+    yield InterfaceTextLine(
+  File "/opt/ros/humble/lib/python3.10/site-packages/ros2interface/verb/show.py", line 43, in __init__
+    msg_spec = parse_message_string(
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rosidl_adapter/parser.py", line 520, in parse_message_string
+    Type(type_string, context_package_name=pkg_name),
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rosidl_adapter/parser.py", line 277, in __init__
+    super(Type, self).__init__(
+  File "/opt/ros/humble/local/lib/python3.10/dist-packages/rosidl_adapter/parser.py", line 190, in __init__
+    raise InvalidResourceName(type_string)
+rosidl_adapter.parser.InvalidResourceName: //
+
+========== aimdk_msgs/srv/SetMcLocomotionSpeedMode ==========
+Could not find the interface '/home/agi/x2_deploy_workspace/aimdk_msgs/share/aimdk_msgs/srv/SetMcLocomotionSpeedMode.idl'
+
+========== aimdk_msgs/srv/GetMcLocomotionSpeedStatus ==========
+Could not find the interface '/home/agi/x2_deploy_workspace/aimdk_msgs/share/aimdk_msgs/srv/GetMcLocomotionSpeedStatus.idl'
+
+========== aimdk_msgs/srv/SetMcInputSource ==========
+# Request 部分
+CommonRequest request
+	RequestHeader header
+		builtin_interfaces/Time stamp
+			int32 sec
+			uint32 nanosec
+
+McInputAction action # ADD MODIFY DELETE DISABLE ENABLE
+	int32 value
+	int32 INPUTACTION_ADD = 1001
+	int32 INPUTACTION_MODIFY = 1002
+	int32 INPUTACTION_DELETE = 1003
+	int32 INPUTACTION_ENABLE = 2001
+	int32 INPUTACTION_DISABLE = 2002
+
+McInputSource input_source
+	string name                           #
+	int32 priority                       #
+	int32 timeout                        #
+---
+
+CommonTaskResponse response
+	ResponseHeader header
+		builtin_interfaces/Time stamp
+			int32 sec
+			uint32 nanosec
+		int64 code
+	uint64 task_id
+	CommonState state
+		int32 value
+		int32 UNKNOWN = 0
+		int32 SUCCESS = 1
+		int32 FAILURE = 2
+		int32 ABORTED = 3
+		int32 TIMEOUT = 4
+		int32 INVALID = 5
+		int32 IN_MANUAL = 6
+		int32 NOT_READY = 100
+		int32 PENDING = 200
+		int32 CREATED = 300
+		int32 RUNNING = 400
+
+========== aimdk_msgs/msg/McInputSource ==========
+# -----------------------------------------------------------------------------------
+# 机器人运控状态 - 输入源信息
+# -----------------------------------------------------------------------------------
+
+string name                           # 输入源名称（rc/vr/app_proxy/interaction/pnc）
+
+int32 priority                       # 输入源优先级(0-100)
+
+int32 timeout                        # 超时时间(ms), 默认 1000 ms
+
+========== nav_msgs/msg/Odometry ==========
+# This represents an estimate of a position and velocity in free space.
+# The pose in this message should be specified in the coordinate frame given by header.frame_id
+# The twist in this message should be specified in the coordinate frame given by the child_frame_id
+
+# Includes the frame id of the pose parent.
+std_msgs/Header header
+	builtin_interfaces/Time stamp
+		int32 sec
+		uint32 nanosec
+	string frame_id
+
+# Frame id the pose points to. The twist is in this coordinate frame.
+string child_frame_id
+
+# Estimated pose that is typically relative to a fixed world frame.
+geometry_msgs/PoseWithCovariance pose
+	Pose pose
+		Point position
+			float64 x
+			float64 y
+			float64 z
+		Quaternion orientation
+			float64 x 0
+			float64 y 0
+			float64 z 0
+			float64 w 1
+	float64[36] covariance
+
+# Estimated linear and angular velocity relative to child_frame_id.
+geometry_msgs/TwistWithCovariance twist
+	Twist twist
+		Vector3  linear
+			float64 x
+			float64 y
+			float64 z
+		Vector3  angular
+			float64 x
+			float64 y
+			float64 z
+	float64[36] covariance
+
+===== odom once =====
