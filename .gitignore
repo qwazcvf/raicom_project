@@ -1,13 +1,39 @@
-.cursorrules
-.marscode/*
-.env
-.idea
-.vscode
-bazel-*
+# logs
+logs/
+competition/logs/
+*.log
 
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# backup files
+*.bak*
+*_backup*
+_old_test_files_*
+_cleanup_backup_*
+competition/tk_remote_keyboard_proxy.py.bak*
+
+# ROS / colcon generated outputs
+build/
+install/
+log/
+competition/ros2_overlay/build/
+competition/ros2_overlay/install/
+competition/ros2_overlay/log/
+
+# external official runtime / large environment
+aimdk_msgs
+Raicom2026/aimdk-aarch64-1bde262f-artifacts/
 Raicom2026/mc/
 Raicom2026/sim_mujoco/
-Raicom2026/aimdk_msgs/
-Raicom2026/aimdk-aarch64-1bde262f-artifacts/
 
-*.zip
+# editor/system
+.vscode/
+.idea/
+.DS_Store
+
+# temporary files
+*.tmp
+*.swp
